@@ -1,0 +1,15 @@
+# Build output
+build/
+*.app
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Never commit credentials — this app reads them from the Keychain at runtime
+*.pem
+*.key
+.env
+.env.*
+credentials.json
