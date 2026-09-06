@@ -2,26 +2,8 @@
 
 A tiny macOS menu bar app that shows your **Claude Code usage** and **when it resets** — the same numbers you get from `/status`, always visible.
 
-```
-┌─────────────────────────────────────────────────────┐
-│  80% · 5m   ⌘ ✎ ▣ ⌨ ▮ ⏚ 🔍                          │  ← menu bar
-└─────────────────────────────────────────────────────┘
-        ↓ click
-┌──────────────────────────────────────────────┐
-│  Session (5h)                                │
-│  ██████████░░░░  80%  resets 16:40 · in 5m   │
-│                                              │
-│  Weekly (all models)                         │
-│  ██░░░░░░░░░░░░  14%  resets Mon 06:30       │
-│  ──────────────────────────────────────────  │
-│  Updated 16:34                               │
-│  Refresh Now                            ⌘R   │
-│  Show Weekly Instead of Countdown            │
-│  Launch at Login                             │
-│  Open Usage Settings…                        │
-│  Quit                                   ⌘Q   │
-└──────────────────────────────────────────────┘
-```
+<img width="418" height="287" alt="image" src="https://github.com/user-attachments/assets/456239c2-66bf-4c86-88c2-2202bfdc2139" />
+
 
 - **Session + weekly limits** with progress bars and live countdowns
 - **Color coded** — normal under 80%, orange at 80%+, red at 95%+
