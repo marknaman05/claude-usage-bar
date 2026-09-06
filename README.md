@@ -7,7 +7,7 @@ A tiny macOS menu bar app that shows your **Claude Code usage** and **when it re
 
 - **Session + weekly limits** with progress bars and live countdowns
 - **Color coded** — normal under 80%, orange at 80%+, red at 95%+
-- **Auto-refreshes** every 60s, on wake from sleep, and when you open the menu
+- **Auto-refreshes** every 5 minutes, with exponential backoff if the API rate-limits
 - **No login of its own** — it reuses the token the `claude` CLI already stored in your Keychain
 - **~600 lines of Swift, zero dependencies**, builds in a couple of seconds
 
@@ -80,7 +80,20 @@ Your token expired or isn't there. Run `claude` once to refresh it — the app p
 
 **Shows `—`**
 
-A network or API error. Open the menu to see the specific reason.
+A network or API error, and there's no earlier reading to fall back on. Open the menu
+to see the specific reason.
+
+**Dimmed/grey numbers**
+
+The last successful reading is being shown because the most recent refresh failed.
+Open the menu for the reason. `Refresh Now` (⌘R) forces an immediate retry, bypassing
+any backoff.
+
+**"Rate limited by the API"**
+
+`/api/oauth/usage` will return HTTP 429 if polled too often. The app refreshes every 5
+minutes and backs off exponentially (10 → 60 min) when throttled, so this should clear
+itself. Your usage numbers keep showing meanwhile.
 
 **`swiftc: command not found`**
 

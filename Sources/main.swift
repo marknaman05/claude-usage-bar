@@ -40,6 +40,7 @@ enum FetchState {
     case ok(Snapshot)
     case noAuth(String)
     case failed(String)
+    case rateLimited(TimeInterval?)
 }
 
 // MARK: - Formatting
@@ -148,10 +149,14 @@ func fetchUsage(completion: @escaping (FetchState) -> Void) {
             completion(.failed(error.localizedDescription))
             return
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
         guard let data, (200..<300).contains(status) else {
             if status == 401 || status == 403 {
                 completion(.noAuth("Not authorized (HTTP \(status)) \u{2014} run `claude`"))
+            } else if status == 429 {
+                let retry = (http?.value(forHTTPHeaderField: "Retry-After")).flatMap(TimeInterval.init)
+                completion(.rateLimited(retry))
             } else {
                 completion(.failed("HTTP \(status)"))
             }
@@ -231,6 +236,12 @@ let kShowWeekly = "showWeeklyInMenuBar"
 final class Controller: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var state: FetchState = .loading
+    /// Last successful reading. Kept so a transient failure shows stale numbers
+    /// rather than blanking the menu bar.
+    var lastGood: Snapshot?
+    var backoff: TimeInterval = 0
+    var nextAllowedFetch: Date?
+    var inFlight = false
     var timer: Timer?
     var tickTimer: Timer?
 
@@ -245,6 +256,8 @@ final class Controller: NSObject, NSMenuDelegate {
         refresh()
 
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            // Fires often, but refresh() itself enforces the real interval and
+            // any rate-limit backoff, so this is just a cheap heartbeat.
             self?.refresh()
         }
         // Keep the "resets in" countdown honest between fetches.
@@ -256,11 +269,41 @@ final class Controller: NSObject, NSMenuDelegate {
         ) { [weak self] _ in self?.refresh() }
     }
 
-    func refresh() {
+    /// Usage windows are 5 hours and 7 days wide, so polling fast buys nothing
+    /// and risks a 429 from the endpoint. The countdown is recomputed locally by
+    /// tickTimer, which needs no network at all.
+    static let normalInterval: TimeInterval = 300      // 5 minutes
+    static let minBackoff: TimeInterval = 600          // after a 429
+    static let maxBackoff: TimeInterval = 3600
+
+    func refresh(force: Bool = false) {
+        if inFlight { return }
+        if !force, let next = nextAllowedFetch, Date() < next { return }
+
+        inFlight = true
         fetchUsage { [weak self] newState in
             DispatchQueue.main.async {
-                self?.state = newState
-                self?.render()
+                guard let self else { return }
+                self.inFlight = false
+
+                switch newState {
+                case .ok(let snap):
+                    self.lastGood = snap
+                    self.backoff = 0
+                    self.nextAllowedFetch = Date().addingTimeInterval(Self.normalInterval)
+                case .rateLimited(let retryAfter):
+                    // Grow the wait each time we're told to slow down.
+                    self.backoff = self.backoff == 0
+                        ? Self.minBackoff
+                        : min(self.backoff * 2, Self.maxBackoff)
+                    let wait = max(retryAfter ?? 0, self.backoff)
+                    self.nextAllowedFetch = Date().addingTimeInterval(wait)
+                default:
+                    self.nextAllowedFetch = Date().addingTimeInterval(Self.normalInterval)
+                }
+
+                self.state = newState
+                self.render()
             }
         }
     }
@@ -271,19 +314,30 @@ final class Controller: NSObject, NSMenuDelegate {
         guard let button = item.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
 
+        // A failed refresh must not wipe numbers we already have: keep showing the
+        // last good reading, just dimmed, so a transient 429 or dropped network
+        // doesn't blank the menu bar.
+        var stale = false
         switch state {
-        case .loading:
-            button.attributedTitle = NSAttributedString(
-                string: "\u{2026}", attributes: [.font: font])
+        case .ok:
+            break
         case .noAuth:
             button.attributedTitle = NSAttributedString(
                 string: "\u{26A0}\u{FE0E} auth",
                 attributes: [.font: font, .foregroundColor: NSColor.systemOrange])
-        case .failed:
-            button.attributedTitle = NSAttributedString(
-                string: "\u{2014}",
-                attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
-        case .ok(let snap):
+            return
+        case .loading, .failed, .rateLimited:
+            if lastGood == nil {
+                let mark = { if case .loading = state { return "\u{2026}" } else { return "\u{2014}" } }()
+                button.attributedTitle = NSAttributedString(
+                    string: mark,
+                    attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
+                return
+            }
+            stale = true
+        }
+
+        if let snap = lastGood {
             // Menu bar space is scarce (a notched display leaves only the strip
             // right of the notch, and macOS silently hides items that no longer
             // fit). So the weekly reading *replaces* the countdown rather than
@@ -295,22 +349,29 @@ final class Controller: NSObject, NSMenuDelegate {
             if let s = snap.session {
                 title.append(NSAttributedString(
                     string: "\(Int(s.percent.rounded()))%",
-                    attributes: [.font: font, .foregroundColor: tintFor(s.percent)]))
+                    attributes: [.font: font,
+                                 .foregroundColor: stale ? NSColor.tertiaryLabelColor
+                                                         : tintFor(s.percent)]))
 
                 if showWeekly, let w = snap.weeklyPeak {
-                    let wTint = w.percent >= 80 ? tintFor(w.percent) : NSColor.secondaryLabelColor
+                    let wTint = stale ? NSColor.tertiaryLabelColor
+                        : (w.percent >= 80 ? tintFor(w.percent) : NSColor.secondaryLabelColor)
                     title.append(NSAttributedString(
                         string: " \(Int(w.percent.rounded()))%",
                         attributes: [.font: small, .foregroundColor: wTint]))
                 } else if let r = s.resetsAt {
                     title.append(NSAttributedString(
                         string: " \u{00B7} \(countdown(to: r))",
-                        attributes: [.font: font, .foregroundColor: tintFor(s.percent)]))
+                        attributes: [.font: font,
+                                     .foregroundColor: stale ? NSColor.tertiaryLabelColor
+                                                             : tintFor(s.percent)]))
                 }
             } else if let w = snap.weeklyPeak {
                 title.append(NSAttributedString(
                     string: "7d \(Int(w.percent.rounded()))%",
-                    attributes: [.font: font, .foregroundColor: tintFor(w.percent)]))
+                    attributes: [.font: font,
+                                 .foregroundColor: stale ? NSColor.tertiaryLabelColor
+                                                         : tintFor(w.percent)]))
             }
 
             button.attributedTitle = title
@@ -320,7 +381,11 @@ final class Controller: NSObject, NSMenuDelegate {
     // MARK: Dropdown
 
     func menuWillOpen(_ menu: NSMenu) {
-        if case .ok(let s) = state, Date().timeIntervalSince(s.fetchedAt) > 20 { refresh() }
+        if let s = lastGood, Date().timeIntervalSince(s.fetchedAt) > Self.normalInterval {
+            refresh()
+        } else if lastGood == nil {
+            refresh()
+        }
         rebuild(menu)
     }
 
@@ -371,14 +436,9 @@ final class Controller: NSObject, NSMenuDelegate {
     func rebuild(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        switch state {
-        case .loading:
-            menu.addItem(info("Loading\u{2026}"))
-        case .noAuth(let msg):
-            menu.addItem(info(msg))
-        case .failed(let msg):
-            menu.addItem(info("Couldn't fetch usage: \(msg)"))
-        case .ok(let snap):
+        // Always show the last good reading if we have one, with the current
+        // problem (if any) noted underneath rather than replacing it.
+        if let snap = lastGood {
             if snap.limits.isEmpty {
                 menu.addItem(info("No limit data reported"))
             }
@@ -391,6 +451,23 @@ final class Controller: NSObject, NSMenuDelegate {
             }
             menu.addItem(.separator())
             menu.addItem(info("Updated \(clockTime(snap.fetchedAt))"))
+        }
+
+        switch state {
+        case .ok:
+            break
+        case .loading:
+            if lastGood == nil { menu.addItem(info("Loading\u{2026}")) }
+        case .noAuth(let msg):
+            menu.addItem(info(msg))
+        case .failed(let msg):
+            menu.addItem(info("Couldn't refresh: \(msg)"))
+        case .rateLimited:
+            var line = "Rate limited by the API"
+            if let next = nextAllowedFetch, next > Date() {
+                line += " \u{2014} retrying in \(countdown(to: next))"
+            }
+            menu.addItem(info(line))
         }
 
         menu.addItem(.separator())
@@ -422,7 +499,7 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.addItem(q)
     }
 
-    @objc func doRefresh() { refresh() }
+    @objc func doRefresh() { refresh(force: true) }
 
     @objc func toggleWeekly() {
         let d = UserDefaults.standard
@@ -472,6 +549,9 @@ if CommandLine.arguments.contains("--probe") {
             if let c = s.creditsUsed { print("Extra usage credits: \(c)") }
         case .noAuth(let m): print("NO AUTH: \(m)")
         case .failed(let m): print("FAILED: \(m)")
+        case .rateLimited(let retry):
+            let extra = retry.map { " (retry after \(Int($0))s)" } ?? ""
+            print("RATE LIMITED: HTTP 429\(extra)")
         case .loading: print("loading")
         }
         sem.signal()
