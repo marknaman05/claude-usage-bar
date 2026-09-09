@@ -229,9 +229,261 @@ func parse(_ json: [String: Any]) -> Snapshot {
     return Snapshot(limits: limits, creditsUsed: credits, fetchedAt: Date())
 }
 
+// MARK: - GitHub contributions
+
+struct ContribDay {
+    var date: Date
+    var count: Int
+    var level: Int
+}
+
+struct Contributions {
+    var user: String
+    var days: [ContribDay]          // ascending by date, ~one year
+    var fetchedAt: Date
+
+    var total: Int { days.reduce(0) { $0 + $1.count } }
+    var today: ContribDay? { days.last }
+
+    /// Consecutive days ending today that have at least one contribution. A day
+    /// with nothing on it yet doesn't break a streak that's still live, so today
+    /// is allowed to be empty; any earlier gap ends the count.
+    var streak: Int {
+        var n = 0
+        for (i, d) in days.enumerated().reversed() {
+            if d.count > 0 { n += 1; continue }
+            if i == days.count - 1 { continue }
+            break
+        }
+        return n
+    }
+}
+
+func attrValue(_ tag: String, _ name: String) -> String? {
+    guard let r = tag.range(of: "\(name)=\"") else { return nil }
+    let rest = tag[r.upperBound...]
+    guard let end = rest.firstIndex(of: "\"") else { return nil }
+    return String(rest[..<end])
+}
+
+/// Parses dates as noon local time. GitHub reports plain calendar dates, and
+/// noon keeps the weekday stable across DST shifts.
+func contribDate(_ s: String) -> Date? {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    f.timeZone = .current
+    guard let d = f.date(from: s) else { return nil }
+    return Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: d) ?? d
+}
+
+/// Scrapes the public contributions calendar. This is the same fragment the
+/// profile page loads, needs no token, and only works for public activity.
+func parseContributions(_ html: String, user: String) -> Contributions? {
+    let ns = html as NSString
+    let full = NSRange(location: 0, length: ns.length)
+
+    // Tooltips carry the counts, keyed to each cell's id.
+    var counts: [String: Int] = [:]
+    let tipRe = try? NSRegularExpression(
+        pattern: "for=\"(contribution-day-component-[^\"]+)\"[^>]*>([^<]*)</tool-tip>")
+    tipRe?.enumerateMatches(in: html, range: full) { m, _, _ in
+        guard let m, m.numberOfRanges == 3 else { return }
+        let id = ns.substring(with: m.range(at: 1))
+        let text = ns.substring(with: m.range(at: 2))
+        let digits = text.prefix { $0.isNumber || $0 == "," }
+            .replacingOccurrences(of: ",", with: "")
+        counts[id] = Int(digits) ?? 0
+    }
+
+    var days: [ContribDay] = []
+    let tdRe = try? NSRegularExpression(pattern: "<td\\b[^>]*>")
+    tdRe?.enumerateMatches(in: html, range: full) { m, _, _ in
+        guard let m else { return }
+        let tag = ns.substring(with: m.range)
+        guard tag.contains("ContributionCalendar-day"),
+              let dateStr = attrValue(tag, "data-date"),
+              let date = contribDate(dateStr) else { return }
+        let level = Int(attrValue(tag, "data-level") ?? "0") ?? 0
+        let count = attrValue(tag, "id").flatMap { counts[$0] } ?? 0
+        days.append(ContribDay(date: date, count: count, level: level))
+    }
+
+    guard !days.isEmpty else { return nil }
+    days.sort { $0.date < $1.date }
+    return Contributions(user: user, days: days, fetchedAt: Date())
+}
+
+enum ContribResult {
+    case ok(Contributions)
+    case failed(String)
+}
+
+func fetchContributions(user: String, completion: @escaping (ContribResult) -> Void) {
+    let escaped = user.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? user
+    guard let url = URL(string: "https://github.com/users/\(escaped)/contributions") else {
+        completion(.failed("Bad username"))
+        return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 15
+    req.setValue("ClaudeUsageBar", forHTTPHeaderField: "User-Agent")
+
+    URLSession.shared.dataTask(with: req) { data, response, error in
+        if let error {
+            completion(.failed(error.localizedDescription))
+            return
+        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard let data, (200..<300).contains(status) else {
+            completion(.failed(status == 404 ? "No such GitHub user" : "HTTP \(status)"))
+            return
+        }
+        guard let html = String(data: data, encoding: .utf8),
+              let contribs = parseContributions(html, user: user) else {
+            completion(.failed("Couldn't read the contribution graph"))
+            return
+        }
+        completion(.ok(contribs))
+    }.resume()
+}
+
+/// Best guess at the user's GitHub handle so the heatmap works without setup:
+/// the `gh` CLI's stored host config first, then a git config fallback.
+func detectGitHubUser() -> String? {
+    let hosts = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/gh/hosts.yml")
+    if let text = try? String(contentsOf: hosts, encoding: .utf8) {
+        for line in text.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("user:") {
+                let name = t.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty { return name }
+            }
+        }
+    }
+    let cfg = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".gitconfig")
+    if let text = try? String(contentsOf: cfg, encoding: .utf8) {
+        for line in text.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("user =") || t.hasPrefix("user=") {
+                let name = t.drop { $0 != "=" }.dropFirst()
+                    .trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty { return name }
+            }
+        }
+    }
+    return nil
+}
+
+// MARK: - Heatmap view
+
+/// The familiar 53x7 calendar: weeks run left to right, weekdays top to bottom.
+final class HeatmapView: NSView {
+    private let cell: CGFloat = 7
+    private let gap: CGFloat = 2
+    private let leftInset: CGFloat = 24
+    private let topInset: CGFloat = 12
+    private let padding: CGFloat = 14
+
+    private var pitch: CGFloat { cell + gap }
+    private var days: [ContribDay] = []
+    private var columns = 53
+    /// Days keyed by their offset from the grid's first cell, so drawing is a
+    /// lookup per cell instead of a scan of the whole year.
+    private var byOffset: [Int: ContribDay] = [:]
+    private var origin = Date()
+
+    init(days: [ContribDay]) {
+        self.days = days
+        let cal = Calendar.current
+        if let first = days.first, let last = days.last {
+            origin = cal.dateInterval(of: .weekOfYear, for: first.date)?.start ?? first.date
+            let b = cal.dateInterval(of: .weekOfYear, for: last.date)?.start ?? last.date
+            let weeks = cal.dateComponents([.weekOfYear], from: origin, to: b).weekOfYear ?? 52
+            columns = max(1, weeks + 1)
+            for d in days {
+                let start = cal.startOfDay(for: d.date)
+                if let off = cal.dateComponents([.day], from: cal.startOfDay(for: origin), to: start).day {
+                    byOffset[off] = d
+                }
+            }
+        }
+        super.init(frame: .zero)
+        let w = leftInset + CGFloat(columns) * pitch - gap + padding
+        let h = topInset + 7 * pitch - gap + 8
+        setFrameSize(NSSize(width: w, height: h))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func palette(_ dark: Bool) -> [NSColor] {
+        func hex(_ v: UInt32) -> NSColor {
+            NSColor(srgbRed: CGFloat((v >> 16) & 0xFF) / 255,
+                    green: CGFloat((v >> 8) & 0xFF) / 255,
+                    blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+        }
+        // GitHub's own scales, with a lifted empty cell so it stays visible on
+        // the translucent menu background.
+        return dark
+            ? [NSColor(white: 1, alpha: 0.10), hex(0x0E4429), hex(0x006D32), hex(0x26A641), hex(0x39D353)]
+            : [NSColor(white: 0, alpha: 0.08), hex(0x9BE9A8), hex(0x40C463), hex(0x30A14E), hex(0x216E39)]
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let colors = palette(dark)
+        let cal = Calendar.current
+
+        guard !days.isEmpty else { return }
+
+        let labelAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+
+        // Weekday gutter - Mon/Wed/Fri only, like the profile page.
+        let symbols = cal.veryShortStandaloneWeekdaySymbols
+        for row in [1, 3, 5] {
+            let idx = (cal.firstWeekday - 1 + row) % 7
+            let y = bounds.height - topInset - CGFloat(row) * pitch - cell
+            (symbols[idx] as NSString).draw(at: NSPoint(x: 6, y: y - 1), withAttributes: labelAttrs)
+        }
+
+        var lastMonth = -1
+        for col in 0..<columns {
+            guard let weekStart = cal.date(byAdding: .weekOfYear, value: col, to: origin) else { continue }
+            let x = leftInset + CGFloat(col) * pitch
+
+            // Month label on the first column that lands in a new month.
+            let month = cal.component(.month, from: weekStart)
+            if month != lastMonth, cal.component(.day, from: weekStart) <= 7 {
+                lastMonth = month
+                let name = cal.shortStandaloneMonthSymbols[month - 1]
+                (name as NSString).draw(at: NSPoint(x: x, y: bounds.height - topInset + 1),
+                                        withAttributes: labelAttrs)
+            }
+
+            for row in 0..<7 {
+                // Cells before the first day or after today have no entry and
+                // aren't drawn at all, so the grid ends where the year does.
+                guard let day = byOffset[col * 7 + row] else { continue }
+
+                let y = bounds.height - topInset - CGFloat(row) * pitch - cell
+                let rect = NSRect(x: x, y: y, width: cell, height: cell)
+                let level = min(4, max(0, day.level))
+                colors[level].setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
+            }
+        }
+    }
+}
+
 // MARK: - App
 
 let kShowWeekly = "showWeeklyInMenuBar"
+let kShowHeatmap = "showGitHubHeatmap"
+let kGitHubUser = "gitHubUser"
 
 final class Controller: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -245,6 +497,11 @@ final class Controller: NSObject, NSMenuDelegate {
     var timer: Timer?
     var tickTimer: Timer?
 
+    var contribs: Contributions?
+    var contribError: String?
+    var contribInFlight = false
+    var nextContribFetch: Date?
+
     override init() {
         super.init()
         let menu = NSMenu()
@@ -254,11 +511,13 @@ final class Controller: NSObject, NSMenuDelegate {
 
         render()
         refresh()
+        refreshContribs()
 
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             // Fires often, but refresh() itself enforces the real interval and
             // any rate-limit backoff, so this is just a cheap heartbeat.
             self?.refresh()
+            self?.refreshContribs()
         }
         // Keep the "resets in" countdown honest between fetches.
         tickTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -304,6 +563,43 @@ final class Controller: NSObject, NSMenuDelegate {
 
                 self.state = newState
                 self.render()
+            }
+        }
+    }
+
+    // MARK: GitHub
+
+    /// The contribution graph only changes when you push, so a slow poll is
+    /// plenty - and it keeps the scrape well clear of anything GitHub would
+    /// consider abusive.
+    static let contribInterval: TimeInterval = 900     // 15 minutes
+
+    var gitHubUser: String? {
+        if let saved = UserDefaults.standard.string(forKey: kGitHubUser), !saved.isEmpty {
+            return saved
+        }
+        return nil
+    }
+
+    func refreshContribs(force: Bool = false) {
+        guard UserDefaults.standard.bool(forKey: kShowHeatmap), let user = gitHubUser else { return }
+        if contribInFlight { return }
+        if !force, contribs?.user == user, let next = nextContribFetch, Date() < next { return }
+
+        contribInFlight = true
+        fetchContributions(user: user) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.contribInFlight = false
+                self.nextContribFetch = Date().addingTimeInterval(Self.contribInterval)
+                switch result {
+                case .ok(let c):
+                    self.contribs = c
+                    self.contribError = nil
+                case .failed(let msg):
+                    // Keep the last graph on screen; note the problem instead.
+                    self.contribError = msg
+                }
             }
         }
     }
@@ -386,6 +682,7 @@ final class Controller: NSObject, NSMenuDelegate {
         } else if lastGood == nil {
             refresh()
         }
+        refreshContribs()
         rebuild(menu)
     }
 
@@ -433,6 +730,39 @@ final class Controller: NSObject, NSMenuDelegate {
         return mi
     }
 
+    private func addHeatmap(to menu: NSMenu) {
+        guard let user = gitHubUser else {
+            let mi = NSMenuItem(title: "Set GitHub Username\u{2026}",
+                                action: #selector(setGitHubUser), keyEquivalent: "")
+            mi.target = self
+            menu.addItem(mi)
+            return
+        }
+
+        menu.addItem(info("GitHub \u{00B7} @\(user)"))
+
+        if let c = contribs, !c.days.isEmpty {
+            let view = HeatmapView(days: c.days)
+            let mi = NSMenuItem()
+            mi.view = view
+            menu.addItem(mi)
+
+            let nf = NumberFormatter()
+            nf.numberStyle = .decimal
+            let total = nf.string(from: NSNumber(value: c.total)) ?? "\(c.total)"
+            var line = "\(total) contributions in the last year"
+            if c.streak > 0 { line += " \u{00B7} \(c.streak) day streak" }
+            if let t = c.today, t.count > 0 { line += " \u{00B7} \(t.count) today" }
+            menu.addItem(info(line))
+        } else if contribError == nil {
+            menu.addItem(info("Loading contributions\u{2026}"))
+        }
+
+        if let err = contribError {
+            menu.addItem(info("Couldn't load contributions: \(err)"))
+        }
+    }
+
     func rebuild(_ menu: NSMenu) {
         menu.removeAllItems()
 
@@ -451,6 +781,11 @@ final class Controller: NSObject, NSMenuDelegate {
             }
             menu.addItem(.separator())
             menu.addItem(info("Updated \(clockTime(snap.fetchedAt))"))
+        }
+
+        if UserDefaults.standard.bool(forKey: kShowHeatmap) {
+            menu.addItem(.separator())
+            addHeatmap(to: menu)
         }
 
         switch state {
@@ -482,6 +817,19 @@ final class Controller: NSObject, NSMenuDelegate {
         weekly.state = UserDefaults.standard.bool(forKey: kShowWeekly) ? .on : .off
         menu.addItem(weekly)
 
+        let heat = NSMenuItem(title: "Show GitHub Heatmap",
+                              action: #selector(toggleHeatmap), keyEquivalent: "")
+        heat.target = self
+        heat.state = UserDefaults.standard.bool(forKey: kShowHeatmap) ? .on : .off
+        menu.addItem(heat)
+
+        if UserDefaults.standard.bool(forKey: kShowHeatmap), gitHubUser != nil {
+            let ghUser = NSMenuItem(title: "GitHub Username\u{2026}",
+                                    action: #selector(setGitHubUser), keyEquivalent: "")
+            ghUser.target = self
+            menu.addItem(ghUser)
+        }
+
         let login = NSMenuItem(title: "Launch at Login",
                                action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
@@ -499,7 +847,41 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.addItem(q)
     }
 
-    @objc func doRefresh() { refresh(force: true) }
+    @objc func doRefresh() {
+        refresh(force: true)
+        refreshContribs(force: true)
+    }
+
+    @objc func toggleHeatmap() {
+        let d = UserDefaults.standard
+        let on = !d.bool(forKey: kShowHeatmap)
+        d.set(on, forKey: kShowHeatmap)
+        if on { refreshContribs(force: true) }
+    }
+
+    @objc func setGitHubUser() {
+        let a = NSAlert()
+        a.messageText = "GitHub Username"
+        a.informativeText = "Whose contribution graph to show. Only public contributions are visible."
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = gitHubUser ?? ""
+        field.placeholderString = "octocat"
+        a.accessoryView = field
+
+        NSApp.activate(ignoringOtherApps: true)
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(name, forKey: kGitHubUser)
+        contribs = nil
+        contribError = nil
+        nextContribFetch = nil
+        refreshContribs(force: true)
+    }
 
     @objc func toggleWeekly() {
         let d = UserDefaults.standard
@@ -529,8 +911,17 @@ final class Controller: NSObject, NSMenuDelegate {
 
 // `--probe` runs one fetch, prints the result, and exits. Useful for verifying
 // Keychain access and the API path without the menu bar.
+UserDefaults.standard.register(defaults: [kShowHeatmap: true])
+// Seed the handle once from whatever the machine already knows, so the heatmap
+// shows up without a setup step. After that it's whatever the user chose.
+if UserDefaults.standard.string(forKey: kGitHubUser) == nil, let detected = detectGitHubUser() {
+    UserDefaults.standard.set(detected, forKey: kGitHubUser)
+}
+
 if CommandLine.arguments.contains("--reset") {
     UserDefaults.standard.removeObject(forKey: kShowWeekly)
+    UserDefaults.standard.removeObject(forKey: kShowHeatmap)
+    UserDefaults.standard.removeObject(forKey: kGitHubUser)
     UserDefaults.standard.synchronize()
     print("Preferences reset. Relaunch the app.")
     exit(0)
@@ -557,6 +948,24 @@ if CommandLine.arguments.contains("--probe") {
         sem.signal()
     }
     _ = sem.wait(timeout: .now() + 20)
+
+    if let user = UserDefaults.standard.string(forKey: kGitHubUser), !user.isEmpty {
+        let ghSem = DispatchSemaphore(value: 0)
+        fetchContributions(user: user) { result in
+            switch result {
+            case .ok(let c):
+                let today = c.today.map { "\($0.count) today" } ?? "no data for today"
+                print("GitHub @\(user): \(c.total) contributions in the last year, "
+                      + "\(c.streak) day streak, \(today)")
+            case .failed(let m):
+                print("GitHub @\(user): \(m)")
+            }
+            ghSem.signal()
+        }
+        _ = ghSem.wait(timeout: .now() + 20)
+    } else {
+        print("GitHub: no username set")
+    }
     exit(0)
 }
 
