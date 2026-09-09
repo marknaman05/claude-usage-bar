@@ -8,6 +8,7 @@ A tiny macOS menu bar app that shows your **Claude Code usage** and **when it re
 - **Session + weekly limits** with progress bars and live countdowns
 - **Color coded** — normal under 80%, orange at 80%+, red at 95%+
 - **Auto-refreshes** every 5 minutes, with exponential backoff if the API rate-limits
+- **GitHub contribution heatmap** in the dropdown — the full last year, plus total and current streak
 - **No login of its own** — it reuses the token the `claude` CLI already stored in your Keychain
 - **~600 lines of Swift, zero dependencies**, builds in a couple of seconds
 
@@ -41,6 +42,7 @@ Prints your current usage to the terminal and exits:
 ```
 Session (5h)             5%  resets 21:49 (in 4h 46m)
 Weekly (all models)     15%  resets Mon 06:29 (in 13h 26m)
+GitHub @octocat: 1284 contributions in the last year, 7 day streak, 3 today
 ```
 
 If this works but the menu bar icon is missing, see [Troubleshooting](#troubleshooting).
@@ -51,13 +53,18 @@ If this works but the menu bar icon is missing, see [Troubleshooting](#troublesh
 2. **Calls the same endpoint `/status` uses:** `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer <token>`.
 3. **Parses the `limits` array** from the response into labeled bars. New limit types (weekly Opus, weekly Sonnet, extra usage credits) render automatically without a code change.
 4. **Draws an `NSStatusItem`** with a compact title and builds the dropdown fresh on each open.
+5. **Scrapes your public contribution calendar** from `https://github.com/users/<you>/contributions` — the same fragment your profile page loads. No token, no GitHub login, refreshed every 15 minutes.
 
-Everything happens locally. The only network call is to Anthropic's own API, with your own token — the same trust boundary as the CLI itself.
+Everything happens locally. The only network calls are to Anthropic's own API with your own token — the same trust boundary as the CLI itself — and to github.com for the public contribution graph.
+
+### GitHub heatmap
+
+The username is guessed once from `~/.config/gh/hosts.yml` (the `gh` CLI's config), falling back to `user` in `~/.gitconfig`. Change it with **GitHub Username…** in the dropdown, or turn the whole section off with **Show GitHub Heatmap**. Only public contributions appear — that's all the endpoint exposes.
 
 ## Privacy & security
 
 - **No secrets are stored in this repo or by the app.** The token is read from the Keychain at runtime and held in memory only.
-- **Nothing is sent anywhere except `api.anthropic.com`.** No analytics, no telemetry, no third-party services.
+- **Nothing is sent anywhere except `api.anthropic.com` and `github.com`.** The GitHub request is an unauthenticated GET of your public profile's contribution graph; disable it with **Show GitHub Heatmap** if you'd rather it never fire. No analytics, no telemetry, no third-party services.
 - **No Screen Recording, Accessibility, or Full Disk Access needed.** The only permission is Keychain read access, which macOS may prompt for once on first launch.
 - The app is **ad-hoc signed** (`codesign -s -`) so the Keychain grant persists across launches. Re-run `./build.sh` after editing and macOS may prompt once more, since the signature changes.
 
